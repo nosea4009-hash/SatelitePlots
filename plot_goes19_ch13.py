@@ -22,10 +22,14 @@ El plot resultante tiene:
 
     - Mapa dentro de un recuadro blanco fino (spines finos, sin ejes de
       lat/lon visibles).
-    - Colormap de infrarrojo tipo GOES (paleta "ir_rgbv" de MetPy: la
-      clasica escala violeta -> azul -> verde -> amarillo -> rojo que se
-      usa para resaltar tapas de nubes frias) mostrada como colorbar al
-      costado del plot.
+    - Colormap de infrarrojo personalizada para el Canal 13 (escala de
+      grises para nubes bajas/superficie, y una escala de colores tipo
+      "realce" para topes de nube frios: cian -> azul -> verde -> amarillo
+      -> naranja -> rojo -> negro -> blanco para los overshooting tops)
+      mostrada como colorbar al costado del plot.
+    - Region por defecto: Provincia de Cordoba (Argentina) y un poco de
+      sus alrededores (se puede cambiar con --extent o desactivar el
+      recorte con --full-disk).
     - Titulo arriba en fuente Arial con el formato:
           GOES-East CH13
           YYYY-MM-DD HH (hora local Argentina, ART = UTC-3)
@@ -38,6 +42,7 @@ Uso
     python plot_goes19_ch13.py archivo.nc
     python plot_goes19_ch13.py archivo.nc --out mi_imagen.png
     python plot_goes19_ch13.py archivo.nc --extent -70 -50 -45 -20
+    python plot_goes19_ch13.py archivo.nc --full-disk
 
 Ver el README.md del repositorio para instrucciones de instalacion del
 entorno de Conda.
@@ -51,12 +56,11 @@ import matplotlib
 
 matplotlib.use("Agg")  # backend no interactivo, seguro para correr sin display
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 from matplotlib import font_manager
-from metpy.plots import add_timestamp  # noqa: F401  (no se usa directamente, pero deja el import documentado)
-from metpy.plots.ctables import registry
 
 # ---------------------------------------------------------------------------
 # Configuracion general
@@ -73,10 +77,79 @@ ART_OFFSET = timedelta(hours=-3)
 IR_TEMP_MIN_C = -80.0
 IR_TEMP_MAX_C = 40.0
 
-# Nombre de la colortable de MetPy para infrarrojo GOES Canal 13.
-# "ir_rgbv" es la paleta clasica violeta-azul-verde-amarillo-rojo usada
-# para resaltar el tope de nubes frias en el canal IR.
-IR_COLORTABLE = "ir_rgbv"
+# Extension geografica por defecto: Provincia de Cordoba (Argentina) y un
+# poco de sus alrededores (sur de Santiago del Estero, suroeste de Santa
+# Fe, este de La Rioja/Catamarca, norte de San Luis/La Pampa).
+# Formato: (lon_min, lon_max, lat_min, lat_max), en grados (PlateCarree).
+DEFAULT_EXTENT_CORDOBA = (-67.0, -60.0, -36.5, -28.0)
+
+# ---------------------------------------------------------------------------
+# Colormap infrarroja personalizada para el Canal 13
+# ---------------------------------------------------------------------------
+# Escala de "counts" (0-256) provista por el usuario, tal como se usa en
+# muchos visores satelitales: escala de grises para temperaturas tibias/
+# calidas (superficie, nubes bajas), y una escala de colores de realce
+# para las temperaturas mas frias (topes de nube profundos), terminando
+# en negro y blanco para los "overshooting tops" mas extremos.
+#
+# Cada stop es (valor_0_256, (R, G, B, A)) con componentes 0-255. Se
+# interpola linealmente entre stops (igual que una escala de gradiente
+# continua), y el rango completo 0-256 se mapea sobre el mismo rango de
+# temperatura que antes: IR_TEMP_MIN_C (-80 C) a IR_TEMP_MAX_C (+40 C).
+IR_CH13_COLOR_STOPS = [
+    (0, (24, 24, 24, 255)),
+    (16, (61, 61, 61, 255)),
+    (34, (97, 97, 97, 255)),
+    (52, (130, 130, 130, 255)),
+    (71, (163, 163, 163, 255)),
+    (126, (217, 217, 217, 255)),
+    (149, (240, 240, 240, 255)),
+    (150, (4, 218, 237, 255)),
+    (159, (0, 98, 179, 255)),
+    (168, (14, 1, 161, 255)),
+    (177, (39, 199, 140, 255)),
+    (186, (0, 255, 38, 255)),
+    (195, (195, 255, 0, 255)),
+    (205, (252, 242, 0, 255)),
+    (214, (247, 163, 0, 255)),
+    (223, (255, 4, 0, 255)),
+    (236, (0, 0, 0, 255)),
+    (256, (255, 255, 255, 255)),
+]
+
+
+def build_ir_ch13_colormap():
+    """Construye una `LinearSegmentedColormap` de Matplotlib a partir de
+    los stops de IR_CH13_COLOR_STOPS, interpolando linealmente entre
+    ellos (igual que una escala de gradiente continua tipo canvas/JS).
+
+    IMPORTANTE sobre la direccion de la escala: en IR_CH13_COLOR_STOPS,
+    el "count" 0 (gris oscuro) representa la temperatura mas CALIDA
+    (superficie / cielo despejado, cerca de IR_TEMP_MAX_C) y el "count"
+    256 (blanco, pasando por la escala de colores y el negro en el
+    medio) representa la temperatura mas FRIA (topes de tormenta
+    profundos / "overshooting tops", cerca de IR_TEMP_MIN_C).
+
+    Como un `Normalize(vmin=IR_TEMP_MIN_C, vmax=IR_TEMP_MAX_C)` mapea la
+    temperatura mas fria a la posicion 0 del colormap y la mas calida a
+    la posicion 1, aca invertimos el orden de los stops (posicion =
+    1 - count/256) para que la relacion count<->temperatura quede
+    correcta: count bajo (gris) <-> calido (posicion 1), count alto
+    (blanco) <-> frio (posicion 0).
+    """
+    positions = [1.0 - (value / 256.0) for value, _ in IR_CH13_COLOR_STOPS]
+    colors = [
+        tuple(component / 255.0 for component in rgba)
+        for _, rgba in IR_CH13_COLOR_STOPS
+    ]
+    # Los stops originales estan ordenados por "count" ascendente, lo que
+    # tras la inversion (1 - count/256) queda en orden de posicion
+    # descendente; hay que reordenar ascendente por posicion para que
+    # LinearSegmentedColormap.from_list los acepte correctamente.
+    stops_sorted = sorted(zip(positions, colors), key=lambda item: item[0])
+    return mcolors.LinearSegmentedColormap.from_list(
+        "ir_ch13_custom", stops_sorted, N=256
+    )
 
 
 def _configure_fonts():
@@ -239,11 +312,17 @@ def load_ch13(nc_path):
     return data, band, scan_start_utc
 
 
-def make_plot(data, band, scan_start_utc, extent=None, dpi=150,
-              figsize=(9, 9)):
+def make_plot(data, band, scan_start_utc, extent=DEFAULT_EXTENT_CORDOBA,
+              dpi=150, figsize=(9, 9)):
     """Genera la figura con estilo MetPy clasico: mapa satelital dentro de
     un recuadro blanco fino, colormap IR con colorbar al costado, y
-    titulos superiores en Arial (GOES-East CHxx / fecha en hora ART)."""
+    titulos superiores en Arial (GOES-East CHxx / fecha en hora ART).
+
+    Por defecto, el mapa se recorta a la region de la Provincia de
+    Cordoba y sus alrededores (`DEFAULT_EXTENT_CORDOBA`). Pasar
+    `extent=None` para graficar el dominio completo del archivo (Full
+    Disk / CONUS / Mesoscale, segun corresponda).
+    """
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
 
@@ -261,10 +340,9 @@ def make_plot(data, band, scan_start_utc, extent=None, dpi=150,
     # a Celsius, que es la convencion habitual para la escala de color IR.
     data_celsius = data.values - 273.15
 
-    # --- Colormap infrarrojo GOES Canal 13 (paleta clasica ir_rgbv) -----
-    ir_norm, ir_cmap = registry.get_with_range(
-        IR_COLORTABLE, IR_TEMP_MIN_C, IR_TEMP_MAX_C
-    )
+    # --- Colormap infrarrojo personalizada del Canal 13 -----------------
+    ir_cmap = build_ir_ch13_colormap()
+    ir_norm = mcolors.Normalize(vmin=IR_TEMP_MIN_C, vmax=IR_TEMP_MAX_C)
 
     im = ax.imshow(
         data_celsius,
@@ -276,17 +354,30 @@ def make_plot(data, band, scan_start_utc, extent=None, dpi=150,
         interpolation="nearest",
     )
 
-    # Limites geograficos opcionales (lon_min, lon_max, lat_min, lat_max)
+    # Limites geograficos opcionales (lon_min, lon_max, lat_min, lat_max).
+    # Por defecto se usa la region de Cordoba y alrededores.
     if extent is not None:
         ax.set_extent(extent, crs=ccrs.PlateCarree())
 
     # --- Costas, paises y provincias/estados (estilo MetPy clasico) ----
-    ax.add_feature(cfeature.COASTLINE, edgecolor="white", linewidth=0.75)
-    ax.add_feature(cfeature.BORDERS, edgecolor="white", linewidth=0.75)
+    # Se usa la resolucion "10m" (mayor detalle) ya que por defecto el
+    # plot esta recortado a una region chica (Cordoba y alrededores);
+    # con un recorte regional, "50m" se ve demasiado poco detallado.
+    feature_scale = "10m" if extent is not None else "50m"
     ax.add_feature(
-        cfeature.STATES.with_scale("50m"),
+        cfeature.COASTLINE.with_scale(feature_scale),
         edgecolor="white",
-        linewidth=0.4,
+        linewidth=0.75,
+    )
+    ax.add_feature(
+        cfeature.BORDERS.with_scale(feature_scale),
+        edgecolor="white",
+        linewidth=0.75,
+    )
+    ax.add_feature(
+        cfeature.STATES.with_scale(feature_scale),
+        edgecolor="white",
+        linewidth=0.5,
     )
 
     # --- Recuadro blanco fino tipo MetPy clasico ------------------------
@@ -368,8 +459,18 @@ def parse_args(argv=None):
         default=None,
         help=(
             "Recorte geografico opcional en grados (PlateCarree): "
-            "lon_min lon_max lat_min lat_max. Si se omite, se grafica "
-            "el dominio completo del archivo."
+            "lon_min lon_max lat_min lat_max. Si se omite, se usa la "
+            "region por defecto (Provincia de Cordoba y alrededores). "
+            "Usar --full-disk para graficar el dominio completo del "
+            "archivo sin recortar."
+        ),
+    )
+    parser.add_argument(
+        "--full-disk",
+        action="store_true",
+        help=(
+            "Grafica el dominio completo del archivo (sin recortar a "
+            "Cordoba). Se ignora si tambien se pasa --extent."
         ),
     )
     parser.add_argument(
@@ -395,11 +496,19 @@ def main(argv=None):
         print(f"ERROR al leer '{args.archivo_nc}': {exc}", file=sys.stderr)
         return 1
 
+    # Prioridad: --extent explicito > --full-disk > region default (Cordoba).
+    if args.extent is not None:
+        extent = tuple(args.extent)
+    elif args.full_disk:
+        extent = None
+    else:
+        extent = DEFAULT_EXTENT_CORDOBA
+
     fig, ax = make_plot(
         data,
         band,
         scan_start_utc,
-        extent=args.extent,
+        extent=extent,
         dpi=args.dpi,
     )
 
