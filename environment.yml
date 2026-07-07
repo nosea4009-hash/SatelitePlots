@@ -1,0 +1,12 @@
+name: sateliteplots
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - metpy
+  - xarray
+  - netcdf4
+  - cartopy
+  - matplotlib
+  - numpy
+  - pandas
